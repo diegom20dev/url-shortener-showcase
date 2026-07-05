@@ -1,99 +1,177 @@
-<p align="center">
-  <a href="http://nestjs.com/" target="blank"><img src="https://nestjs.com/img/logo-small.svg" width="120" alt="Nest Logo" /></a>
-</p>
+# URL Shortener
 
-[circleci-image]: https://img.shields.io/circleci/build/github/nestjs/nest/master?token=abc123def456
-[circleci-url]: https://circleci.com/gh/nestjs/nest
+[![CI](https://github.com/diegom20dev/url-shortener-showcase/actions/workflows/ci.yml/badge.svg)](https://github.com/diegom20dev/url-shortener-showcase/actions/workflows/ci.yml)
 
-  <p align="center">A progressive <a href="http://nodejs.org" target="_blank">Node.js</a> framework for building efficient and scalable server-side applications.</p>
-    <p align="center">
-<a href="https://www.npmjs.com/~nestjscore" target="_blank"><img src="https://img.shields.io/npm/v/@nestjs/core.svg" alt="NPM Version" /></a>
-<a href="https://www.npmjs.com/~nestjscore" target="_blank"><img src="https://img.shields.io/npm/l/@nestjs/core.svg" alt="Package License" /></a>
-<a href="https://www.npmjs.com/~nestjscore" target="_blank"><img src="https://img.shields.io/npm/dm/@nestjs/common.svg" alt="NPM Downloads" /></a>
-<a href="https://circleci.com/gh/nestjs/nest" target="_blank"><img src="https://img.shields.io/circleci/build/github/nestjs/nest/master" alt="CircleCI" /></a>
-<a href="https://coveralls.io/github/nestjs/nest?branch=master" target="_blank"><img src="https://coveralls.io/repos/github/nestjs/nest/badge.svg?branch=master#9" alt="Coverage" /></a>
-<a href="https://discord.gg/G7Qnnhy" target="_blank"><img src="https://img.shields.io/badge/discord-online-brightgreen.svg" alt="Discord"/></a>
-<a href="https://opencollective.com/nest#backer" target="_blank"><img src="https://opencollective.com/nest/backers/badge.svg" alt="Backers on Open Collective" /></a>
-<a href="https://opencollective.com/nest#sponsor" target="_blank"><img src="https://opencollective.com/nest/sponsors/badge.svg" alt="Sponsors on Open Collective" /></a>
-  <a href="https://paypal.me/kamilmysliwiec" target="_blank"><img src="https://img.shields.io/badge/Donate-PayPal-ff3f59.svg" alt="Donate us"/></a>
-    <a href="https://opencollective.com/nest#sponsor"  target="_blank"><img src="https://img.shields.io/badge/Support%20us-Open%20Collective-41B883.svg" alt="Support us"></a>
-  <a href="https://twitter.com/nestframework" target="_blank"><img src="https://img.shields.io/twitter/follow/nestframework.svg?style=social&label=Follow" alt="Follow us on Twitter"></a>
-</p>
-  <!--[![Backers on Open Collective](https://opencollective.com/nest/backers/badge.svg)](https://opencollective.com/nest#backer)
-  [![Sponsors on Open Collective](https://opencollective.com/nest/sponsors/badge.svg)](https://opencollective.com/nest#sponsor)-->
+A production-minded URL shortener built as a **backend / system-design showcase**. It converts long URLs into compact **Base62** codes, serves high-throughput **302 redirects** backed by a **Redis cache**, supports per-URL **expiry (TTL)**, and enforces **distributed, Redis-backed rate limiting** — all on a clean **hexagonal architecture**.
 
-## Description
+## Overview
 
-[Nest](https://github.com/nestjs/nest) framework TypeScript starter repository.
+The domain is intentionally simple — shorten a URL, redirect to it — but the engineering underneath is production-grade. The redirect is the hot path of any URL shortener, so it is optimized with a cache-aside strategy; the write path is protected with per-API-key rate limits; and both are fully decoupled from the framework and infrastructure via ports and adapters.
 
-## Project setup
+The goal is to demonstrate how a few well-chosen patterns — deterministic short-code generation, cache-aside reads, TTL-based expiry, and distributed rate limiting — combine into a system that stays fast and reliable under load.
 
-```bash
-$ npm install
+## Architecture
+
+Hexagonal architecture (ports and adapters). The domain core has no knowledge of NestJS, PostgreSQL, or Redis — it only exposes **ports** (interfaces) that the infrastructure layer implements.
+
+```
+┌────────────────────────── infrastructure (adapters) ──────────────────────────┐
+│                                                                                │
+HTTP ──► urls.controller ──► [application: use-cases] ──► [domain: Url + Base62] │
+│  (guards: api-key,          CreateShortUrl                    ▲                 │
+│   throttler)                ResolveShortUrl                   │                 │
+│                                 │           │            (ports)                │
+│                          (port) ▼           ▼ (port)                            │
+│                     UrlRepository       UrlCache                                │
+│                       (TypeORM)         (ioredis)                               │
+│                          │                  │                                  │
+│                          ▼                  ▼                                  │
+│                      PostgreSQL           Redis                                │
+└────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-## Compile and run the project
+| Layer | Folder | Knows about | Does NOT know about |
+|---|---|---|---|
+| **Domain** | `src/urls/domain` | pure TS (entity, Base62, ports) | NestJS, DB, Redis |
+| **Application** | `src/urls/application` | domain + ports | concrete DB, HTTP, cache |
+| **Infrastructure** | `src/urls/infrastructure` | everything (implements ports) | — |
 
-```bash
-# development
-$ npm run start
+## Request Flows
 
-# watch mode
-$ npm run start:dev
+### Create — `POST /api/urls`
 
-# production mode
-$ npm run start:prod
+```
+x-api-key ──► [RequireApiKey] ──► [ApiKeyThrottler 10/min·100/day] ──► validate DTO
+   ──► repo.nextId() ──► encodeBase62(id) = code ──► apply TTL (≤24h) ──► persist ──► 201
 ```
 
-## Run tests
+### Resolve — `GET /api/urls/:code`  (the hot path — cache-aside)
 
-```bash
-# unit tests
-$ npm run test
-
-# e2e tests
-$ npm run test:e2e
-
-# test coverage
-$ npm run test:cov
+```
+Redis GET url:<code>
+   ├─ HIT  ─────────────────────────────────────────────► 302 redirect
+   └─ MISS ─► DB lookup
+                ├─ not found ─────────────────────────► 404
+                ├─ expired ───────────────────────────► 410 GONE
+                └─ found ─► cache SET (TTL = remaining) ► 302 redirect
 ```
 
-## Deployment
+## Engineering Patterns
 
-When you're ready to deploy your NestJS application to production, there are some key steps you can take to ensure it runs as efficiently as possible. Check out the [deployment documentation](https://docs.nestjs.com/deployment) for more information.
+### Collision-Free Short Codes — Base62 over a Monotonic ID
 
-If you are looking for a cloud-based platform to deploy your NestJS application, check out [Mau](https://mau.nestjs.com), our official platform for deploying NestJS applications on AWS. Mau makes deployment straightforward and fast, requiring just a few simple steps:
+Codes are the **Base62 encoding of a monotonic database id**, not random strings:
 
-```bash
-$ npm install -g mau
-$ mau deploy
+```
+ALPHABET = 0-9 a-z A-Z   (62 symbols)
+code = encodeBase62(repo.nextId())
 ```
 
-With Mau, you can deploy your application in just a few clicks, allowing you to focus on building features rather than managing infrastructure.
+This makes generation **collision-free by construction** — no duplicate checks, no retry loops. Trade-off (worth knowing in an interview): sequential ids produce *enumerable* codes, which is acceptable for a public shortener but would need randomization/obfuscation if code enumeration were a concern.
 
-## Resources
+### Cache-Aside Reads — Redis
 
-Check out a few resources that may come in handy when working with NestJS:
+Redirects hit Redis first and only fall back to PostgreSQL on a miss, then backfill the cache:
 
-- Visit the [NestJS Documentation](https://docs.nestjs.com) to learn more about the framework.
-- For questions and support, please visit our [Discord channel](https://discord.gg/G7Qnnhy).
-- To dive deeper and get more hands-on experience, check out our official video [courses](https://courses.nestjs.com/).
-- Deploy your application to AWS with the help of [NestJS Mau](https://mau.nestjs.com) in just a few clicks.
-- Visualize your application graph and interact with the NestJS application in real-time using [NestJS Devtools](https://devtools.nestjs.com).
-- Need help with your project (part-time to full-time)? Check out our official [enterprise support](https://enterprise.nestjs.com).
-- To stay in the loop and get updates, follow us on [X](https://x.com/nestframework) and [LinkedIn](https://linkedin.com/company/nestjs).
-- Looking for a job, or have a job to offer? Check out our official [Jobs board](https://jobs.nestjs.com).
+```
+key   = url:<code>
+SET url:<code> <longUrl> EX <ttlSeconds>   # ttl aligned to the URL's remaining life
+```
 
-## Support
+Redis is configured as a real cache (`maxmemory` + `allkeys-lru` eviction), so it stays bounded under load, and cache entries can never outlive the record they mirror.
 
-Nest is an MIT-licensed open source project. It can grow thanks to the sponsors and support by the amazing backers. If you'd like to join them, please [read more here](https://docs.nestjs.com/support).
+### Expiry & TTL
 
-## Stay in touch
+URLs can carry an optional TTL (capped at 24h). Expiry is enforced at resolve time, returning a distinct **`410 GONE`** for a code that existed but has lapsed — a correct, separate signal from `404 Not Found`.
 
-- Author - [Kamil Myśliwiec](https://twitter.com/kammysliwiec)
-- Website - [https://nestjs.com](https://nestjs.com/)
-- Twitter - [@nestframework](https://twitter.com/nestframework)
+### Distributed Rate Limiting — Redis-Backed Throttler
 
-## License
+`@nestjs/throttler` is backed by **Redis storage** (not in-memory), so limits hold **across multiple instances**. Three independent tiers:
 
-Nest is [MIT licensed](https://github.com/nestjs/nest/blob/master/LICENSE).
+```
+POST /urls   →  10 / minute   +  100 / day     (scoped per api-key)
+GET  /:code  →  100 / second                   (scoped per IP)
+```
+
+The `x-api-key` header is an **opaque rate-limit scope**, documented in Swagger as *not* validated against any store — it identifies a caller for throttling, it is not authentication.
+
+### Hexagonal Architecture
+
+The domain (URL entity, Base62 service, ports) is pure and fully unit-tested; infrastructure (TypeORM repository, ioredis cache, HTTP controller + guards) implements the ports. Swapping PostgreSQL or Redis would not touch the domain.
+
+## Tech Stack
+
+| Technology | Role |
+|---|---|
+| **NestJS** | Framework — modular, DI-friendly, Swagger built-in |
+| **TypeScript** | Type safety across all layers |
+| **PostgreSQL** | Persistence — urls table with migrations |
+| **TypeORM** | ORM — repository, migrations, data source |
+| **Redis + ioredis** | Cache-aside store for redirects |
+| **@nestjs/throttler + throttler-storage-redis** | Distributed, Redis-backed rate limiting |
+| **class-validator / class-transformer** | DTO validation |
+| **@nestjs/swagger** | Interactive OpenAPI docs |
+| **Jest + Supertest** | Unit tests + e2e |
+| **Docker Compose** | One-command Postgres + Redis for local dev |
+| **GitHub Actions** | CI — lint, test, build on every push |
+
+## API Endpoints
+
+All routes are prefixed with `/api`. Interactive docs at `/docs` (Swagger UI).
+
+| Method | Route | Description |
+|---|---|---|
+| `POST` | `/api/urls` | Create a short URL (`x-api-key` required) — `201 / 400 / 429` |
+| `GET` | `/api/urls/:shortUrl` | Resolve and **302** redirect to the original URL — `302 / 404 / 410 / 429` |
+
+## Running Locally
+
+```bash
+# 1. Copy environment variables
+cp .env.example .env
+
+# 2. Start dependencies (Postgres + Redis)
+docker compose up -d
+
+# 3. Install, run migrations, and start (hot reload)
+npm install
+npm run migration:run    # TypeORM migrations (src/database/migrations)
+npm run start:dev
+
+# API:     http://localhost:3000/api
+# Swagger: http://localhost:3000/docs
+```
+
+```bash
+# Tests
+npm test          # unit tests
+npm run test:e2e  # end-to-end (requires Postgres + Redis)
+```
+
+> `docker-compose.yml` provisions **Postgres + Redis only**; the API runs via npm.
+
+## Project Structure
+
+```
+src/
+├── urls/
+│   ├── domain/                  # Pure domain — no framework dependencies
+│   │   ├── entities/url.entity.ts
+│   │   ├── services/base62-encoder.ts
+│   │   └── ports/               # UrlRepositoryPort, UrlCachePort
+│   ├── application/
+│   │   ├── dtos/
+│   │   └── use-cases/           # CreateShortUrl, ResolveShortUrl
+│   └── infrastructure/
+│       ├── http/                # Controller, guards, throttler config
+│       ├── cache/               # ioredis adapter + Redis provider
+│       └── persistence/typeorm/ # Repository + entity
+├── database/                    # data-source + migrations
+└── main.ts
+```
+
+## Roadmap / Next Steps
+
+- **Click analytics** — async click counting via an event/queue, kept off the redirect hot path.
+- **Live deployment** + public Swagger URL.
+- Custom aliases and an opt-in randomized-code strategy.
