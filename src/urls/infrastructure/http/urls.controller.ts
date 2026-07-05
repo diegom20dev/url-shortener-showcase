@@ -77,6 +77,14 @@ export class UrlsController {
   @Get(':shortUrl')
   @ApiOperation({
     summary: 'Resolve a short URL and redirect to the original longUrl',
+    description:
+      'Note: Swagger UI\'s "Try it out" runs requests through the browser\'s ' +
+      'fetch(), which follows redirects automatically before showing you a ' +
+      "result — you won't see the raw 302 there, only the final " +
+      'destination (or a CORS/network error, since it points off-site). ' +
+      'To see the actual 302 + Location header, use curl -i, a client ' +
+      'with redirects disabled (e.g. Postman), or paste the URL directly ' +
+      'into the browser address bar.',
   })
   @ApiResponse({
     status: 302,
